@@ -1,6 +1,5 @@
 {
-  "buildCommand": "cd csv-bulk-upload-module && npm install && npm run build",
-  "outputDirectory": "csv-bulk-upload-module/.next",
   "framework": "nextjs",
-  "installCommand": "cd csv-bulk-upload-module && npm install"
+  "buildCommand": "npm run build",
+  "installCommand": "npm install"
 }
