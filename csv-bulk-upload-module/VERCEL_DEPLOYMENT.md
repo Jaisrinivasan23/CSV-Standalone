@@ -21,14 +21,34 @@ Repository: https://github.com/Jaisrinivasan23/CSV-Standalone.git
    - Click "Environment Variables"
    - Add these from your `.env.local` file:
      ```
-     AWS_REGION=your-region
+     # Django API
+     NEXT_PUBLIC_DJANGO_API_URL=https://gcp.galactus.run
+     
+     # AWS S3
+     AWS_S3_BUCKET=topmate-staging
      AWS_ACCESS_KEY_ID=your-key
      AWS_SECRET_ACCESS_KEY=your-secret
-     S3_BUCKET_NAME=your-bucket
-     DYNAMODB_TABLE_NAME=your-table
+     AWS_REGION=ap-south-1
+     AWS_REGION_CUSTOM=ap-south-1
+     S3_BASE_URL=https://topmate-staging.s3.ap-south-1.amazonaws.com
+     
+     # Base URL (LEAVE BLANK - will auto-set after deployment)
+     NEXT_PUBLIC_BASE_URL=
+     
+     # Optional - if using Lambda
      SQS_QUEUE_URL=your-queue-url
+     DYNAMODB_JOBS_TABLE=your-table
+     
+     # Next.js
+     NODE_ENV=production
+     DISABLE_IMAGE_OPTIMIZATION=true
      ```
 7. **Click "Deploy"**
+8. **After First Deployment**:
+   - Copy your Vercel URL (e.g., `https://csv-standalone.vercel.app`)
+   - Go to **Settings** → **Environment Variables**
+   - Update `NEXT_PUBLIC_BASE_URL` to your Vercel URL
+   - **Redeploy** the project
 
 ### Option 2: Deploy via Vercel CLI
 
