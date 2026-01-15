@@ -1,0 +1,227 @@
+service: csv-bulk-upload
+
+frameworkVersion: '3'
+
+provider:
+  name: aws
+  runtime: nodejs20.x
+  region: ${opt:region, 'ap-south-1'}  # Mumbai region for production
+  stage: ${opt:stage, 'dev'}
+  timeout: 30  # Default timeout
+  memorySize: 512  # Default memory
+
+  # IAM permissions for Lambda functions
+  iam:
+    role:
+      statements:
+        # S3 access for file uploads
+        - Effect: Allow
+          Action:
+            - s3:PutObject
+            - s3:PutObjectAcl
+            - s3:GetObject
+          Resource:
+            - arn:aws:s3:::${env:AWS_S3_BUCKET}/*
+
+        # SQS access for bulk generation queue
+        - Effect: Allow
+          Action:
+            - sqs:SendMessage
+            - sqs:ReceiveMessage
+            - sqs:DeleteMessage
+            - sqs:GetQueueAttributes
+          Resource:
+            - Fn::GetAtt: [BulkJobQueue, Arn]
+
+        # DynamoDB access for job tracking
+        - Effect: Allow
+          Action:
+            - dynamodb:PutItem
+            - dynamodb:GetItem
+            - dynamodb:UpdateItem
+            - dynamodb:Query
+            - dynamodb:Scan
+          Resource:
+            - Fn::GetAtt: [JobsTable, Arn]
+            - Fn::Join:
+                - '/'
+                - - Fn::GetAtt: [JobsTable, Arn]
+                  - 'index/*'
+
+        # CloudWatch Logs
+        - Effect: Allow
+          Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+          Resource:
+            - arn:aws:logs:${self:provider.region}:*:*
+
+  # Environment variables for all functions
+  environment:
+    NODE_ENV: production
+    AWS_S3_BUCKET: ${env:AWS_S3_BUCKET}
+    AWS_REGION_CUSTOM: ${env:AWS_REGION, 'ap-south-1'}
+    S3_BASE_URL: ${env:S3_BASE_URL}
+    NEXT_PUBLIC_DJANGO_API_URL: ${env:NEXT_PUBLIC_DJANGO_API_URL}
+    SQS_QUEUE_URL:
+      Ref: BulkJobQueue
+    DYNAMODB_JOBS_TABLE:
+      Ref: JobsTable
+    DISABLE_IMAGE_OPTIMIZATION: true
+
+plugins:
+  - serverless-dotenv-plugin
+  - serverless-offline
+
+# Custom configuration
+custom:
+  dotenv:
+    path: .env.local  # Use local env file for development
+
+# Package configuration
+package:
+  individually: false
+  patterns:
+    - '!.git/**'
+    - '!.github/**'
+    - '!.next/cache/**'
+    - '!node_modules/.cache/**'
+    - '!test-*.js'
+    - '!*.md'
+    - '!scripts/**'
+    - '!public/generated-posters/**'
+    - '.next/**'
+    - 'public/**'
+    - 'node_modules/**'
+    - 'app/**'
+    - 'handlers/**'
+
+functions:
+  # Bulk job submission (fast - splits into batches)
+  submitBulkJob:
+    handler: handlers/bulk-submit.handler
+    timeout: 30
+    memorySize: 512
+    events:
+      - httpApi:
+          path: /api/generate-bulk
+          method: POST
+
+  # Bulk worker (processes micro-batches of 50 images)
+  bulkWorker:
+    handler: handlers/bulk-worker.handler
+    timeout: 900  # 15 minutes (max Lambda timeout)
+    memorySize: 2048  # 2GB for processing 50 images (50 images × 8 concurrent)
+    reservedConcurrency: 10  # Allow 10 workers in parallel (10 × 50 = 500 images concurrently)
+    layers:
+      - ${env:SHARP_LAYER_ARN}
+    events:
+      - sqs:
+          arn:
+            Fn::GetAtt: [BulkJobQueue, Arn]
+          batchSize: 1  # Process 1 SQS message (1 batch) at a time
+          maximumConcurrency: 100  # Max 100 concurrent Lambda executions
+
+  # Job status endpoint (fast lookup)
+  getJobStatus:
+    handler: handlers/job-status.handler
+    timeout: 10
+    memorySize: 256
+    events:
+      - httpApi:
+          path: /api/job-status/{jobId}
+          method: GET
+
+  # S3 upload endpoint
+  uploadS3:
+    handler: handlers/upload-s3.handler
+    timeout: 30
+    memorySize: 512
+    layers:
+      - ${env:SHARP_LAYER_ARN}
+    events:
+      - httpApi:
+          path: /api/upload-s3
+          method: POST
+
+# CloudFormation resources
+resources:
+  Resources:
+    # SQS Queue for bulk generation micro-batches
+    BulkJobQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: csv-bulk-upload-queue-${self:provider.stage}
+        VisibilityTimeout: 1020  # 17 minutes (longer than Lambda timeout)
+        MessageRetentionPeriod: 86400  # 24 hours
+        ReceiveMessageWaitTimeSeconds: 20  # Long polling
+        RedrivePolicy:
+          deadLetterTargetArn:
+            Fn::GetAtt: [BulkJobDLQ, Arn]
+          maxReceiveCount: 3  # Retry failed batches 3 times
+
+    # Dead Letter Queue for failed batches
+    BulkJobDLQ:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: csv-bulk-upload-dlq-${self:provider.stage}
+        MessageRetentionPeriod: 1209600  # 14 days (for investigation)
+
+    # DynamoDB table for job status tracking
+    JobsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: csv-bulk-upload-jobs-${self:provider.stage}
+        BillingMode: PAY_PER_REQUEST  # On-demand pricing
+        AttributeDefinitions:
+          - AttributeName: jobId
+            AttributeType: S
+          - AttributeName: userId
+            AttributeType: S
+          - AttributeName: createdAt
+            AttributeType: N
+        KeySchema:
+          - AttributeName: jobId
+            KeyType: HASH
+        GlobalSecondaryIndexes:
+          - IndexName: UserIdCreatedAtIndex
+            KeySchema:
+              - AttributeName: userId
+                KeyType: HASH
+              - AttributeName: createdAt
+                KeyType: RANGE
+            Projection:
+              ProjectionType: ALL
+        TimeToLiveSpecification:
+          AttributeName: ttl
+          Enabled: true  # Auto-delete jobs after 7 days
+        StreamSpecification:
+          StreamViewType: NEW_AND_OLD_IMAGES
+
+  # CloudFormation outputs
+  Outputs:
+    ApiUrl:
+      Description: API Gateway URL
+      Value:
+        Fn::Sub: https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com
+
+    BulkQueueUrl:
+      Description: SQS Queue URL for bulk jobs
+      Value:
+        Ref: BulkJobQueue
+
+    BulkQueueArn:
+      Description: SQS Queue ARN
+      Value:
+        Fn::GetAtt: [BulkJobQueue, Arn]
+
+    JobsTableName:
+      Description: DynamoDB table for job tracking
+      Value:
+        Ref: JobsTable
+
+    DeadLetterQueueUrl:
+      Description: Dead Letter Queue URL
+      Value:
+        Ref: BulkJobDLQ
